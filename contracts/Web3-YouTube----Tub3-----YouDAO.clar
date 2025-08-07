@@ -6,6 +6,8 @@
 (define-constant err-already-exists (err u104))
 (define-constant err-invalid-input (err u105))
 (define-constant err-voting-ended (err u106))
+(define-constant err-subscription-expired (err u107))
+(define-constant err-subscription-not-found (err u108))
 
 (define-fungible-token tub3-token)
 
@@ -95,6 +97,26 @@
     { vote: bool, voting-power: uint }
 )
 
+(define-map creator-subscriptions
+    { creator: principal }
+    {
+        subscription-price: uint,
+        total-subscribers: uint,
+        monthly-revenue: uint,
+        active: bool
+    }
+)
+
+(define-map user-subscriptions
+    { subscriber: principal, creator: principal }
+    {
+        start-block: uint,
+        expiry-block: uint,
+        monthly-payment: uint,
+        auto-renew: bool
+    }
+)
+
 (define-private (is-contract-owner)
     (is-eq tx-sender contract-owner)
 )
@@ -120,6 +142,24 @@
             (try! (ft-mint? tub3-token platform-fee contract-owner))
             (map-set videos { video-id: video-id }
                 (merge video-data { total-revenue: (+ (get total-revenue video-data) amount) }))
+            (ok true)
+        )
+    )
+)
+
+(define-private (is-subscription-active (subscriber principal) (creator principal))
+    (match (map-get? user-subscriptions { subscriber: subscriber, creator: creator })
+        subscription (>= (get expiry-block subscription) stacks-block-height)
+        false
+    )
+)
+
+(define-private (process-subscription-payment (subscriber principal) (creator principal) (amount uint))
+    (let ((platform-fee (/ (* amount (var-get platform-fee-rate)) u10000))
+          (creator-share (- amount platform-fee)))
+        (begin
+            (try! (ft-transfer? tub3-token amount subscriber contract-owner))
+            (try! (ft-mint? tub3-token creator-share creator))
             (ok true)
         )
     )
@@ -332,6 +372,158 @@
     )
 )
 
+(define-public (setup-creator-subscription (subscription-price uint))
+    (let ((creator tx-sender))
+        (asserts! (> subscription-price u0) err-invalid-input)
+        
+        (map-set creator-subscriptions { creator: creator }
+            {
+                subscription-price: subscription-price,
+                total-subscribers: u0,
+                monthly-revenue: u0,
+                active: true
+            }
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (subscribe-to-creator (creator principal))
+    (let ((subscription-data (unwrap! (map-get? creator-subscriptions { creator: creator }) err-not-found))
+          (subscriber tx-sender)
+          (subscription-price (get subscription-price subscription-data))
+          (expiry-block (+ stacks-block-height u4320)))
+        
+        (asserts! (get active subscription-data) err-unauthorized)
+        (asserts! (>= (ft-get-balance tub3-token subscriber) subscription-price) err-insufficient-funds)
+        (asserts! (is-none (map-get? user-subscriptions { subscriber: subscriber, creator: creator })) err-already-exists)
+        
+        (try! (process-subscription-payment subscriber creator subscription-price))
+        
+        (map-set user-subscriptions { subscriber: subscriber, creator: creator }
+            {
+                start-block: stacks-block-height,
+                expiry-block: expiry-block,
+                monthly-payment: subscription-price,
+                auto-renew: false
+            }
+        )
+        
+        (map-set creator-subscriptions { creator: creator }
+            (merge subscription-data { 
+                total-subscribers: (+ (get total-subscribers subscription-data) u1),
+                monthly-revenue: (+ (get monthly-revenue subscription-data) subscription-price)
+            }))
+        
+        (ok true)
+    )
+)
+
+(define-public (renew-subscription (creator principal))
+    (let ((subscription (unwrap! (map-get? user-subscriptions { subscriber: tx-sender, creator: creator }) err-subscription-not-found))
+          (creator-data (unwrap! (map-get? creator-subscriptions { creator: creator }) err-not-found))
+          (subscription-price (get monthly-payment subscription))
+          (new-expiry (+ (get expiry-block subscription) u4320)))
+        
+        (asserts! (get active creator-data) err-unauthorized)
+        (asserts! (>= (ft-get-balance tub3-token tx-sender) subscription-price) err-insufficient-funds)
+        
+        (try! (process-subscription-payment tx-sender creator subscription-price))
+        
+        (map-set user-subscriptions { subscriber: tx-sender, creator: creator }
+            (merge subscription { expiry-block: new-expiry }))
+        
+        (map-set creator-subscriptions { creator: creator }
+            (merge creator-data { 
+                monthly-revenue: (+ (get monthly-revenue creator-data) subscription-price)
+            }))
+        
+        (ok true)
+    )
+)
+
+(define-public (cancel-subscription (creator principal))
+    (let ((subscription (unwrap! (map-get? user-subscriptions { subscriber: tx-sender, creator: creator }) err-subscription-not-found))
+          (creator-data (unwrap! (map-get? creator-subscriptions { creator: creator }) err-not-found)))
+        
+        (map-delete user-subscriptions { subscriber: tx-sender, creator: creator })
+        
+        (map-set creator-subscriptions { creator: creator }
+            (merge creator-data { 
+                total-subscribers: (- (get total-subscribers creator-data) u1)
+            }))
+        
+        (ok true)
+    )
+)
+
+(define-public (upload-exclusive-video (title (string-ascii 100)) (ipfs-hash (string-ascii 100)) (duration uint))
+    (let ((video-id (var-get next-video-id))
+          (creator tx-sender))
+        (asserts! (> (len title) u0) err-invalid-input)
+        (asserts! (> (len ipfs-hash) u0) err-invalid-input)
+        (asserts! (> duration u0) err-invalid-input)
+        (asserts! (is-some (map-get? creator-subscriptions { creator: creator })) err-unauthorized)
+        
+        (map-set videos { video-id: video-id }
+            {
+                creator: creator,
+                title: title,
+                ipfs-hash: ipfs-hash,
+                duration: duration,
+                upload-block: stacks-block-height,
+                total-views: u0,
+                total-revenue: u0,
+                status: "subscriber-only"
+            }
+        )
+        
+        (let ((profile (default-to 
+                { username: "", reputation: u100, total-earnings: u0, videos-created: u0, videos-watched: u0 }
+                (map-get? user-profiles { user: creator }))))
+            (map-set user-profiles { user: creator }
+                (merge profile { videos-created: (+ (get videos-created profile) u1) }))
+        )
+        
+        (var-set next-video-id (+ video-id u1))
+        (ok video-id)
+    )
+)
+
+(define-public (watch-exclusive-video (video-id uint) (watch-duration uint))
+    (let ((video-data (unwrap! (map-get? videos { video-id: video-id }) err-not-found))
+          (viewer tx-sender)
+          (creator (get creator video-data))
+          (completion-rate (/ (* watch-duration u100) (get duration video-data))))
+        
+        (asserts! (is-eq (get status video-data) "subscriber-only") err-unauthorized)
+        (asserts! (> watch-duration u0) err-invalid-input)
+        (asserts! (is-subscription-active viewer creator) err-subscription-expired)
+        
+        (map-set watch-sessions { video-id: video-id, viewer: viewer }
+            {
+                watch-time: watch-duration,
+                completion-rate: completion-rate,
+                last-watch-block: stacks-block-height,
+                reward-claimed: false
+            }
+        )
+        
+        (map-set videos { video-id: video-id }
+            (merge video-data { total-views: (+ (get total-views video-data) u1) }))
+        
+        (let ((profile (default-to 
+                { username: "", reputation: u100, total-earnings: u0, videos-created: u0, videos-watched: u0 }
+                (map-get? user-profiles { user: viewer }))))
+            (map-set user-profiles { user: viewer }
+                (merge profile { videos-watched: (+ (get videos-watched profile) u1) }))
+        )
+        
+        (ok completion-rate)
+    )
+)
+
 (define-read-only (get-video (video-id uint))
     (map-get? videos { video-id: video-id })
 )
@@ -362,4 +554,16 @@
 
 (define-read-only (get-balance (user principal))
     (ft-get-balance tub3-token user)
+)
+
+(define-read-only (get-creator-subscription (creator principal))
+    (map-get? creator-subscriptions { creator: creator })
+)
+
+(define-read-only (get-user-subscription (subscriber principal) (creator principal))
+    (map-get? user-subscriptions { subscriber: subscriber, creator: creator })
+)
+
+(define-read-only (check-subscription-status (subscriber principal) (creator principal))
+    (is-subscription-active subscriber creator)
 )
