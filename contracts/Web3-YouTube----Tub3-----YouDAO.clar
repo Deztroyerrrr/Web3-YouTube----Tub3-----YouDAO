@@ -567,3 +567,24 @@
 (define-read-only (check-subscription-status (subscriber principal) (creator principal))
     (is-subscription-active subscriber creator)
 )
+
+(define-map video-bookmarks { user: principal, video-id: uint } { bookmarked-at: uint })
+
+(define-public (bookmark-video (video-id uint))
+  (let ((user tx-sender))
+    (asserts! (is-some (map-get? videos { video-id: video-id })) err-not-found)
+    (asserts! (is-none (map-get? video-bookmarks { user: user, video-id: video-id })) err-already-exists)
+    (ok (map-set video-bookmarks { user: user, video-id: video-id } { bookmarked-at: stacks-block-height }))
+  )
+)
+
+(define-public (remove-bookmark (video-id uint))
+  (let ((user tx-sender))
+    (asserts! (is-some (map-get? video-bookmarks { user: user, video-id: video-id })) err-not-found)
+    (ok (map-delete video-bookmarks { user: user, video-id: video-id }))
+  )
+)
+
+(define-read-only (is-video-bookmarked (user principal) (video-id uint))
+  (is-some (map-get? video-bookmarks { user: user, video-id: video-id }))
+)
