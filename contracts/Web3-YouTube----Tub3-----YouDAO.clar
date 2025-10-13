@@ -588,3 +588,17 @@
 (define-read-only (is-video-bookmarked (user principal) (video-id uint))
   (is-some (map-get? video-bookmarks { user: user, video-id: video-id }))
 )
+
+(define-public (tip-creator (video-id uint) (amount uint))
+  (let ((video-data (unwrap! (map-get? videos { video-id: video-id }) err-not-found))
+        (creator (get creator video-data))
+        (tipper tx-sender))
+    (asserts! (> amount u0) err-invalid-input)
+    (asserts! (>= (ft-get-balance tub3-token tipper) amount) err-insufficient-funds)
+    (try! (ft-transfer? tub3-token amount tipper creator))
+    (let ((profile (default-to
+            { username: "", reputation: u100, total-earnings: u0, videos-created: u0, videos-watched: u0 }
+            (map-get? user-profiles { user: creator }))))
+      (map-set user-profiles { user: creator }
+        (merge profile { total-earnings: (+ (get total-earnings profile) amount) })))
+    (ok true)))
