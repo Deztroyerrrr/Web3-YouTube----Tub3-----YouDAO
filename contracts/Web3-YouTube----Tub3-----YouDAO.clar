@@ -16,6 +16,7 @@
 (define-data-var next-video-id uint u1)
 (define-data-var next-clip-id uint u1)
 (define-data-var next-proposal-id uint u1)
+(define-data-var next-playlist-id uint u1)
 (define-data-var platform-fee-rate uint u500)
 
 (define-map videos
@@ -570,6 +571,22 @@
 
 (define-map video-bookmarks { user: principal, video-id: uint } { bookmarked-at: uint })
 
+(define-map playlists
+    { playlist-id: uint }
+    {
+        creator: principal,
+        title: (string-ascii 100),
+        description: (string-ascii 200),
+        created-at: uint,
+        total-videos: uint
+    }
+)
+
+(define-map playlist-videos
+    { playlist-id: uint, video-id: uint }
+    { added-at: uint }
+)
+
 (define-public (bookmark-video (video-id uint))
   (let ((user tx-sender))
     (asserts! (is-some (map-get? videos { video-id: video-id })) err-not-found)
@@ -602,3 +619,52 @@
       (map-set user-profiles { user: creator }
         (merge profile { total-earnings: (+ (get total-earnings profile) amount) })))
     (ok true)))
+
+(define-public (create-playlist (title (string-ascii 100)) (description (string-ascii 200)))
+    (let ((playlist-id (var-get next-playlist-id))
+          (creator tx-sender))
+        (asserts! (> (len title) u0) err-invalid-input)
+        (map-set playlists { playlist-id: playlist-id }
+            {
+                creator: creator,
+                title: title,
+                description: description,
+                created-at: stacks-block-height,
+                total-videos: u0
+            }
+        )
+        (var-set next-playlist-id (+ playlist-id u1))
+        (ok playlist-id)
+    )
+)
+
+(define-public (add-video-to-playlist (playlist-id uint) (video-id uint))
+    (let ((playlist (unwrap! (map-get? playlists { playlist-id: playlist-id }) err-not-found))
+          (video (unwrap! (map-get? videos { video-id: video-id }) err-not-found)))
+        (asserts! (is-eq (get creator playlist) tx-sender) err-unauthorized)
+        (asserts! (is-none (map-get? playlist-videos { playlist-id: playlist-id, video-id: video-id })) err-already-exists)
+        (map-set playlist-videos { playlist-id: playlist-id, video-id: video-id } { added-at: stacks-block-height })
+        (map-set playlists { playlist-id: playlist-id }
+            (merge playlist { total-videos: (+ (get total-videos playlist) u1) }))
+        (ok true)
+    )
+)
+
+(define-public (remove-video-from-playlist (playlist-id uint) (video-id uint))
+    (let ((playlist (unwrap! (map-get? playlists { playlist-id: playlist-id }) err-not-found)))
+        (asserts! (is-eq (get creator playlist) tx-sender) err-unauthorized)
+        (asserts! (is-some (map-get? playlist-videos { playlist-id: playlist-id, video-id: video-id })) err-not-found)
+        (map-delete playlist-videos { playlist-id: playlist-id, video-id: video-id })
+        (map-set playlists { playlist-id: playlist-id }
+            (merge playlist { total-videos: (- (get total-videos playlist) u1) }))
+        (ok true)
+    )
+)
+
+(define-read-only (get-playlist (playlist-id uint))
+    (map-get? playlists { playlist-id: playlist-id })
+)
+
+(define-read-only (get-playlist-videos (playlist-id uint))
+    (map-get? playlist-videos { playlist-id: playlist-id, video-id: u0 })
+)
